@@ -1,0 +1,10 @@
+# PLE competition entry. Fields: ple/kit/README.md#submissionyaml
+name: ple-harness
+# Target model for Stage 2 (one of the 8 google-cloud/<id> models). See PLAN.md "Model choice".
+model_api: google-cloud/claude-opus-5-5
+install: >-
+  uv venv --python 3.12 /opt/harness/venv
+  && uv pip install --python /opt/harness/venv/bin/python -r {src}/requirements.txt
+serve: /opt/harness/venv/bin/python {src}/serve.py
+env:
+  COMPACT_AT_TOKENS: "150000"
