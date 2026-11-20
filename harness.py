@@ -18,12 +18,18 @@ Connects to `MODEL_BASE_URL` using `MODEL_API_KEY` and `MODEL_NAME`. The model
 works in the task container through four built-in tools (`bash`, `read_file`,
 `write_file`, `edit_file`) plus the task's own MCP tools, and finishes when it
 provides a complete answer without calling a tool. That answer becomes the final
-message. Calls go to the Chat Completions API, or to the Responses API for
+message, unless required deliverables named in the task are still missing or
+the answer only announces a next step: then the model is sent back to work (up
+to `EARLY_STOP_NUDGES` times). Calls go to the Chat Completions API, or to the Responses API for
 OpenAI's GPT-6 models (`RESPONSES_MODELS`).
 
 Optional environment variables: `MAX_OUTPUT_TOKENS` (default `32000`),
-`COMPACT_AT_TOKENS` (default `150000`), and `REASONING_EFFORT` (default `max`
-for Claude, GLM, GPT-6 and DeepSeek-V4, `high` for other models).
+`COMPACT_AT_TOKENS` (default `150000`), `REASONING_EFFORT` (default `max`
+for Claude, GLM, GPT-6 and DeepSeek-V4, `high` for other models), and the
+per-task compute caps `BUDGET_USD` (estimated list-price spend) and
+`TOKEN_BUDGET` (input plus output tokens); a cap of `0` (the default) is off.
+At 70% of a cap the model is told to make sure its deliverables are complete;
+at 100% it is asked for its final summary.
 """
 
 from __future__ import annotations
@@ -33,7 +39,9 @@ import json
 import os
 import posixpath
 import re
+import shlex
 import sys
+import time
 import types
 from typing import Any
 
@@ -67,6 +75,93 @@ MAX_TOOLS = 128
 KEEP_RECENT_RESULTS = 12
 FINISH_MARGIN_SEC = 180
 RETRY_WAITS = (5, 15, 30, 60, 120)
+# Per-task compute caps (0 = off). Cost is estimated from reported usage at
+# list prices, the way the leaderboard prices a task.
+BUDGET_USD = float(os.environ.get("BUDGET_USD") or 0)
+TOKEN_BUDGET = int(os.environ.get("TOKEN_BUDGET") or 0)
+BUDGET_WARN = 0.7
+# USD per 1M tokens (input, cached input, output): Vertex AI list prices,
+# post-promo, gathered 2026-11-17. Matched as a substring of MODEL_NAME.
+PRICES = {
+    "claude-opus-5-5": (4.0, 0.20, 20.0),
+    "gemini-4-argon": (4.0, 0.20, 20.0),
+    "gemini-3.8-flash": (1.50, 0.15, 7.50),
+    "gemini-3.1-pro": (2.0, 0.20, 12.0),
+    "gpt-oss-120b": (0.09, 0.09, 0.36),
+    "glm-5.2": (1.40, 0.14, 4.40),
+    "gemma-4-26b": (0.15, 0.015, 0.60),
+    "llama-4-maverick": (0.35, 0.35, 1.15),
+}
+PRICE = next((p for name, p in PRICES.items() if name in MODEL.lower()), None)
+# Deliverable checks. The harness reads the absolute file paths the task names
+# (those missing at the start are the deliverables) and the output folders under
+# the workdir, then tests them at these shares of the task (the larger of time
+# and budget used) and every CHECK_EVERY_TURNS tool turns, telling the model
+# exactly which are still missing. When the task names neither, the checkpoints
+# show the files changed so far instead.
+CHECKPOINTS = (0.15, 0.3, 0.5, 0.7, 0.85)
+CHECK_EVERY_TURNS = 20
+# When the budget runs out, or RESCUE_SEC before the time does, with
+# deliverables still missing, the model gets up to RESCUE_TURNS more tool turns
+# to write them.
+RESCUE_TURNS = 12
+RESCUE_SEC = 900
+OUTPUT_DIRS = ("output", "outputs", "deliverables")
+DELIVERABLE_PATH = re.compile(
+    r"(?<![\w.@+-])(/[\w.@+-]+(?:/[\w.@+-]+)*\.[A-Za-z0-9]{1,5})(?![\w/])"
+)
+MISSING_NOTE = (
+    "[Deliverable check ({why}): these required deliverables do not exist yet:"
+    " {missing}. Only files on disk when the task ends are graded. Write a"
+    " complete first version of each now, at exactly that path, from your best"
+    " current results (state assumptions and anything unverified in it), then"
+    " keep improving it in place.]"
+)
+CHECKPOINT_NOTE = (
+    "[Checkpoint: {pct}% of this task's time or compute is used. Files created"
+    " or changed so far under the work directory:\n{files}\nList every"
+    " deliverable the task requires and confirm each exists at its exact path,"
+    " name and format. Write a complete first draft of any that is missing now,"
+    " before refining anything else.]"
+)
+RESCUE_NOTE = (
+    "[The {what} for this task is used up, and these required deliverables do"
+    " not exist yet: {missing}. Stop the analysis. Within at most {turns} tool"
+    " calls, write each one at exactly that path from the results you already"
+    " have (mark unverified values as such), then answer with your summary.]"
+)
+# A reply without a tool call ends the task. When one comes while required
+# deliverables are missing, or only announces a next step ("Now let me read
+# ..."), the model is sent back to work, at most EARLY_STOP_NUDGES times a task.
+EARLY_STOP_NUDGES = 3
+NEXT_STEP_TAIL = re.compile(r"(?::|\.\.\.|…)\s*$")
+NEXT_STEP_PHRASE = re.compile(
+    r"\b(?:let me(?! know)|let's|i will|i'll|i am going to|i'm going to"
+    r"|next,? i)\b",
+    re.I,
+)
+NEXT_STEP_MAX_CHARS = 400
+# A reply whose hidden reasoning used the whole output limit, leaving no text and
+# no tool call, lowers the reasoning effort a step and asks the model to act;
+# after THINK_CUTOFFS such replies in a row the task moves to its summary.
+THINK_CUTOFFS = 4
+EFFORT_STEP_DOWN = {
+    "max": "high",
+    "xhigh": "high",
+    "high": "medium",
+    "medium": "low",
+}
+THINK_NOTE = (
+    "[Your reasoning used the whole {limit}-token output limit before you"
+    " acted, so nothing happened. Reason briefly: take the next concrete step"
+    " now with a tool call, and write long content to files in parts.{missing}]"
+)
+EARLY_STOP_NOTE = (
+    "[Your reply had no tool call, which ends the task, but {why}. The task is"
+    " not finished: continue with tool calls{then}. Answer without a tool call"
+    " only once every deliverable is written and complete.]"
+)
+
 # How endpoints word an error saying the conversation no longer fits (xAI's:
 # "maximum prompt length is N but the request contains M tokens"). OpenAI's
 # error for too many tools ("'tools': array too long") does not match.
@@ -98,6 +193,8 @@ UNREAD_KEEP = 600
 CONTEXT_MARGIN = 1024
 # How endpoints word an error refusing a parameter or value outright, unlike one
 # that names a smaller maximum.
+# reasoning_effort values, lowest first
+EFFORT_LEVELS = ("minimal", "low", "medium", "high", "xhigh", "max")
 UNSUPPORTED = re.compile(
     r"unsupported|unrecogni[sz]ed|unknown|not supported|does not support|not"
     r" (allowed|permitted)"
@@ -540,6 +637,14 @@ def response_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
   return items
 
 
+def cached_tokens(usage: Any) -> int:
+  """Returns the cached prompt tokens a Chat Completions `usage` reports."""
+  return (
+      getattr(getattr(usage, "prompt_tokens_details", None), "cached_tokens", 0)
+      or 0
+  )
+
+
 def chat_usage(usage: Any) -> Any:
   """Returns Responses API `usage` in the shape `record` and `report` read.
 
@@ -816,9 +921,24 @@ class Agent:
     self.token_limit = "max_completion_tokens"
     # empty once an endpoint refuses it
     self.effort = {"reasoning_effort": EFFORT}
+    self.refused_efforts: set[str | None] = set()
     # whether calls go to the Responses API rather than Chat Completions
     self.responses = MODEL.lower().startswith(RESPONSES_MODELS)
     self.finish_margin = FINISH_MARGIN_SEC
+    self.spent_usd = 0.0  # estimated list-price spend so far
+    self.tokens_used = 0  # input plus output tokens so far
+    self.answered = False  # whether the model has produced any reply
+    self.total_time: float | None = None  # task time at the start
+    self.checkpoints = 0  # CHECKPOINTS already passed
+    self.turns = 0  # tool turns so far
+    self.expected: list[str] = []  # deliverable paths missing at the start
+    self.output_dirs: list[str] = []  # output folders under the workdir
+    self.rescue: int | None = None  # tool turns left to write deliverables
+    self.rescue_checked = False
+    self.budget_warned = False
+    self.early_stops = 0
+    self.think_cutoffs = 0
+    self.started = time.monotonic()
 
   async def run(self) -> str:
     """Runs the agent tool-calling loop until the task is complete.
@@ -828,6 +948,7 @@ class Agent:
     """
     mcp = await self.connect_mcp()
     left = self.session.time_left()
+    self.total_time = left
     # time kept for the final summary: FINISH_MARGIN_SEC, or a quarter of a
     # short task's time
     self.finish_margin = (
@@ -846,6 +967,7 @@ class Agent:
         },
         {"role": "user", "content": self.session.instruction},
     ]
+    await self.scan_deliverables()
     # head: the text of an answer cut off at the output limit
     nudges, head = 0, ""
     while True:
@@ -861,6 +983,17 @@ class Agent:
       # what it streamed is the answer if the summary call fails too
       except CutOff:
         return await self.finish("Time is almost up.")
+      except openai.OpenAIError as exc:
+        # Before any model output, fail: the evaluator re-runs a harness that
+        # fails before its model produced anything. After it, end with what
+        # was delivered rather than crash: written files are graded anyway,
+        # and the final message reaches the graders only through `done`.
+        if not self.answered:
+          raise
+        return await self.fallback(
+            f"The model stopped answering ({type(exc).__name__}:"
+            f" {str(exc)[:200]})."
+        )
       arguments = [parse_arguments(call) for call in reply.calls.values()]
       if reply.text or reply.calls:
         # A turn with neither (its output went to hidden reasoning, or a content
@@ -884,8 +1017,39 @@ class Agent:
               ),
           })
           continue
+        if reply.finish == "length" and not visible(reply.text):
+          # hidden reasoning used the whole output limit: think less, act
+          self.think_cutoffs += 1
+          if self.think_cutoffs > THINK_CUTOFFS:
+            return await self.finish(
+                "Your reasoning keeps using the whole output limit."
+            )
+          lowered = self.lower_effort()
+          missing = await self.missing_deliverables()
+          await self.session.log(
+              f"reasoning cut off at the output limit ({self.think_cutoffs}"
+              f" in a row); effort now {lowered or 'unchanged'}"
+          )
+          self.messages.append({
+              "role": "user",
+              "content": THINK_NOTE.format(
+                  limit=self.max_output,
+                  missing=(
+                      " Still missing: " + ", ".join(missing) + "."
+                      if missing
+                      else ""
+                  ),
+              ),
+          })
+          continue
         if visible(reply.text) or nudges >= 2:
-          return text or self.session.final_message
+          answer = text or self.session.final_message
+          note = await self.early_stop_note(answer)
+          if note is None:
+            return answer
+          nudges, head = 0, ""
+          self.messages.append({"role": "user", "content": note})
+          continue
         nudges += 1  # only consecutive empty turns end the run
         self.messages.append({
             "role": "user",
@@ -896,6 +1060,7 @@ class Agent:
         })
         continue
       nudges, head = 0, ""
+      self.think_cutoffs = 0
       for call, args in zip(reply.calls.values(), arguments):
         result = (
             await self.run_tool(call["name"], args)
@@ -913,6 +1078,43 @@ class Agent:
       left = self.session.time_left()
       if left is not None:
         self.messages[-1]["content"] += f"\n[{int(left // 60)} minutes left]"
+      self.turns += 1
+      used = self.budget_used()
+      near_end = (
+          left is not None
+          and bool(self.total_time)
+          and self.total_time > 2 * RESCUE_SEC
+          and left < self.finish_margin + RESCUE_SEC
+      )
+      notes = []
+      if self.rescue is not None:
+        self.rescue -= 1
+        if self.rescue <= 0:
+          return await self.finish(
+              "The time or compute for this task is used up."
+          )
+      elif (used >= 1 or near_end) and not self.rescue_checked:
+        self.rescue_checked = True
+        missing = await self.missing_deliverables()
+        if missing:
+          self.rescue = RESCUE_TURNS
+          notes.append(
+              RESCUE_NOTE.format(
+                  what="compute budget" if used >= 1 else "time",
+                  missing=", ".join(missing),
+                  turns=RESCUE_TURNS,
+              )
+          )
+        elif used >= 1:
+          return await self.finish(
+              "The compute budget for this task is used up."
+          )
+      elif used >= 1:
+        return await self.finish("The compute budget for this task is used up.")
+      if self.rescue is None:
+        notes += await self.progress_notes(used)
+      if notes:
+        self.messages[-1]["content"] += "\n" + "\n".join(notes)
       if self.prompt_tokens > self.compact_at():
         await self.compact()
 
@@ -947,6 +1149,187 @@ class Agent:
     except (CutOff, openai.OpenAIError, OutOfTime):
       text = ""
     return text or self.session.final_message
+
+  async def early_stop_note(self, text: str) -> str | None:
+    """Checks an answer given without a tool call before it ends the task.
+
+    Args:
+      text: The visible answer.
+
+    Returns:
+      A note sending the model back to work, or None to accept the answer.
+    """
+    if self.early_stops >= EARLY_STOP_NUDGES:
+      return None
+    if self.budget_used() >= 1 and not self.rescue:
+      return None
+    why, then = "", ""
+    missing = await self.missing_deliverables()
+    if missing:
+      why = "these required deliverables do not exist yet: " + ", ".join(missing)
+      then = ", and write each one at exactly that path"
+    elif NEXT_STEP_TAIL.search(text) or (
+        len(text) <= NEXT_STEP_MAX_CHARS and NEXT_STEP_PHRASE.search(text)
+    ):
+      why = "it announces a next step rather than summarizing finished work"
+    if not why:
+      return None
+    self.early_stops += 1
+    await self.session.log(f"early stop {self.early_stops}: {why[:200]}")
+    return EARLY_STOP_NOTE.format(why=why, then=then)
+
+  async def progress_notes(self, used: float) -> list[str]:
+    """Returns the budget warning and deliverable-check notes due this turn.
+
+    Args:
+      used: Share of the compute budget used so far.
+
+    Returns:
+      Notes to append to the latest tool result (possibly none).
+    """
+    notes = []
+    if used >= BUDGET_WARN and not self.budget_warned:
+      self.budget_warned = True
+      notes.append(
+          f"[{int(used * 100)}% of this task's compute budget is used. Make"
+          " sure every deliverable is written and complete, then finish with"
+          " your summary.]"
+      )
+    progress = max(used, self.time_used())
+    passed = sum(1 for share in CHECKPOINTS if progress >= share)
+    checkpoint = passed > self.checkpoints
+    self.checkpoints = passed
+    periodic = self.turns % CHECK_EVERY_TURNS == 0
+    if not (checkpoint or periodic):
+      return notes
+    if self.expected or self.output_dirs:
+      missing = await self.missing_deliverables()
+      if missing:
+        why = (
+            f"{int(progress * 100)}% of the time or compute used"
+            f" after {self.turns} tool turns"
+        )
+        notes.append(MISSING_NOTE.format(why=why, missing=", ".join(missing)))
+    elif checkpoint:
+      notes.append(
+          CHECKPOINT_NOTE.format(
+              pct=int(progress * 100), files=await self.changed_files()
+          )
+      )
+    return notes
+
+  async def scan_deliverables(self) -> None:
+    """Finds the deliverable paths and output folders the task implies."""
+    named = sorted(set(DELIVERABLE_PATH.findall(self.session.instruction)))[:40]
+    names = " ".join(shlex.quote(p) for p in named)
+    pattern = " -o ".join(f"-name {d}" for d in OUTPUT_DIRS)
+    command = (
+        f'for p in {names}; do [ -e "$p" ] || echo "F $p"; done; '
+        f"find {shlex.quote(self.session.workdir)} -maxdepth 3 -type d"
+        f" \\( {pattern} \\) -printf 'D %p\\n' 2>/dev/null | head -10"
+    )
+    try:
+      result = await self.session.exec(command, 30)
+    except taskbridge.TaskError:
+      return
+    for line in (result.get("output") or "").splitlines():
+      kind, _, path = line.partition(" ")
+      if kind == "F" and path:
+        self.expected.append(path)
+      elif kind == "D" and path:
+        self.output_dirs.append(path)
+    await self.session.log(
+        f"deliverables: {self.expected or '-'}; output folders:"
+        f" {self.output_dirs or '-'}"
+    )
+
+  async def missing_deliverables(self) -> list[str]:
+    """Returns the expected deliverables that do not exist (or are empty)."""
+    if not (self.expected or self.output_dirs):
+      return []
+    files = " ".join(shlex.quote(p) for p in self.expected)
+    dirs = " ".join(
+        shlex.quote(d)
+        for d in self.output_dirs
+        if not any(p.startswith(d.rstrip("/") + "/") for p in self.expected)
+    )
+    command = (
+        f'for p in {files}; do [ -s "$p" ] || echo "$p"; done; '
+        f'for d in {dirs}; do [ -n "$(find "$d" -type f 2>/dev/null | head -1)" ]'
+        ' || echo "a file under $d/"; done'
+    )
+    try:
+      result = await self.session.exec(command, 30)
+    except taskbridge.TaskError:
+      return []
+    return [l for l in (result.get("output") or "").splitlines() if l.strip()]
+
+  async def fallback(self, why: str) -> str:
+    """Ends the task without the model, listing what was delivered.
+
+    Args:
+      why: Why the model cannot be used; logged, not shown to graders.
+
+    Returns:
+      A final message naming the files written so far.
+    """
+    await self.session.log(why)
+    text = (
+        "The session ended early. Files created or changed under"
+        f" {self.session.workdir}:\n{await self.changed_files()}"
+    )
+    if self.session.final_message:
+      text += f"\n\nLatest progress note:\n{self.session.final_message}"
+    self.session.final_message = text
+    return text
+
+  def budget_used(self) -> float:
+    """Returns the largest share of a compute cap used so far (0 if none)."""
+    shares = [0.0]
+    if BUDGET_USD > 0:
+      shares.append(self.spent_usd / BUDGET_USD)
+    if TOKEN_BUDGET > 0:
+      shares.append(self.tokens_used / TOKEN_BUDGET)
+    return max(shares)
+
+  def time_used(self) -> float:
+    """Returns the share of the task's time used so far (0 if unlimited)."""
+    left = self.session.time_left()
+    if not self.total_time or left is None:
+      return 0.0
+    return min(1.0, max(0.0, 1 - left / self.total_time))
+
+  async def changed_files(self) -> str:
+    """Lists files created or changed under the workdir during this task."""
+    left = self.session.time_left()
+    elapsed = (
+        (self.total_time - left)
+        if self.total_time is not None and left is not None
+        else time.monotonic() - self.started
+    )
+    minutes = int(elapsed // 60) + 2
+    command = (
+        f"find {shlex.quote(self.session.workdir)} -xdev -type f"
+        f" -mmin -{minutes} -not -path '*/.*' -not -path '*/__pycache__/*'"
+        " -not -path '*/node_modules/*' -printf '%p (%s bytes)\\n'"
+        " 2>/dev/null | sort | head -40"
+    )
+    try:
+      result = await self.session.exec(command, 30)
+    except taskbridge.TaskError:
+      return "(could not list files)"
+    return (result.get("output") or "").strip() or "(none)"
+
+  def charge(self, prompt: int, cached: int, completion: int) -> None:
+    """Adds one call's tokens and estimated list-price cost to the totals."""
+    self.tokens_used += prompt + completion
+    if PRICE is not None:
+      rate_in, rate_cached, rate_out = PRICE
+      self.spent_usd += (
+          max(prompt - cached, 0) * rate_in
+          + cached * rate_cached
+          + completion * rate_out
+      ) / 1e6
 
   async def connect_mcp(self) -> str:
     """Connects to the task's MCP servers and registers their tools.
@@ -1183,6 +1566,21 @@ class Agent:
     self.token_limit = "max_tokens"
     return True
 
+  def lower_effort(self) -> str | None:
+    """Steps `reasoning_effort` down one common level (max/xhigh, high, medium,
+    low), skipping levels the endpoint refused.
+
+    Returns:
+      The new level, or None if the effort is unset or already lowest.
+    """
+    level = self.effort.get("reasoning_effort")
+    while level in EFFORT_STEP_DOWN:
+      level = EFFORT_STEP_DOWN[level]
+      if level not in self.refused_efforts:
+        self.effort = {"reasoning_effort": level}
+        return level
+    return None
+
   def drop_effort(self, error: str) -> bool:
     """Stops sending `reasoning_effort` once an endpoint refuses it.
 
@@ -1195,9 +1593,22 @@ class Agent:
     Returns:
       `True` if `reasoning_effort` was being sent and is now dropped.
     """
-    if not self.effort or not re.search(r"reasoning[._]effort", error):
+    if not self.effort or not re.search(r"reasoning[._ ]effort", error, re.I):
       return False
-    self.effort = {}
+    current = self.effort.get("reasoning_effort")
+    self.refused_efforts.add(current)
+    # a server that lists the levels it accepts gets the nearest one at or
+    # below the refused level ("Supported types are xhigh, medium, and low")
+    offered = [
+        level
+        for level in EFFORT_LEVELS
+        if level not in self.refused_efforts
+        and re.search(rf"(?<![\w-]){level}(?![\w-])", error, re.I)
+    ]
+    rank = EFFORT_LEVELS.index(current) if current in EFFORT_LEVELS else 0
+    below = [l for l in offered if EFFORT_LEVELS.index(l) < rank]
+    choice = below[-1] if below else (offered[0] if offered else None)
+    self.effort = {"reasoning_effort": choice} if choice else {}
     return True
 
   def shrink_output(self, error: str) -> bool:
@@ -1472,10 +1883,17 @@ class Agent:
     Args:
       reply: Completed `Reply` from `stream()`.
     """
+    self.answered = True
     if reply.usage is None:
       self.prompt_tokens = self.estimate_prompt_tokens()
+      self.charge(self.prompt_tokens, 0, len(reply.text) // 4)
       return
     self.prompt_tokens = reply.usage.prompt_tokens or 0
+    self.charge(
+        self.prompt_tokens,
+        cached_tokens(reply.usage),
+        reply.usage.completion_tokens or 0,
+    )
     await self.report(reply)
 
   async def report(self, reply: Reply) -> None:
@@ -1487,14 +1905,11 @@ class Agent:
     usage = reply.usage
     if usage is None:
       return
-    cached = (
-        getattr(
-            getattr(usage, "prompt_tokens_details", None), "cached_tokens", 0
-        )
-        or 0
-    )
     await self.session.usage(
-        MODEL, usage.prompt_tokens or 0, usage.completion_tokens or 0, cached
+        MODEL,
+        usage.prompt_tokens or 0,
+        usage.completion_tokens or 0,
+        cached_tokens(usage),
     )
 
   async def run_tool(self, name: str, args: dict[str, Any]) -> str:

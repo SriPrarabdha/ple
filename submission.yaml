@@ -8,3 +8,5 @@ install: >-
 serve: /opt/harness/venv/bin/python {src}/serve.py
 env:
   COMPACT_AT_TOKENS: "150000"
+  # Per-task cap on estimated list-price spend (harness.py BUDGET_USD); public best Opus entries average ~$15/task.
+  BUDGET_USD: "20"
